@@ -107,6 +107,16 @@ def rate_song(user_id: str, song_id: str, score: int) -> Rating:
 
     db.session.commit()
 
+    # Notify the person who originally shared the song, but only on a new
+    # rating (not score edits) and not when they rated their own song —
+    # mirroring add_to_playlist's notification behavior.
+    if existing is None and song.shared_by != user_id:
+        create_notification(
+            user_id=song.shared_by,
+            notification_type="song_rated",
+            body=f"{rater.username} rated your song '{song.title}' {score}/5.",
+        )
+
     return rating
 
 
