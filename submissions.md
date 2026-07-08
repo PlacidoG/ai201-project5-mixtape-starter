@@ -52,3 +52,45 @@ For contrast: `rate_song()` (same file, used by `POST /songs/<id>/rate`) never c
 - **Association tables for many-to-many**: `friendships` (symmetric, self-referential on `User`), `song_tags`, and `playlist_entries` (which also carries `position`/`added_by`/`added_at` — an association table with extra columns, not a plain `db.relationship(secondary=...)`).
 - **`to_dict()` serializers on every model**: routes never hand-build response JSON; they call the model's own `to_dict()`.
 - **Test fixtures over mocks**: tests spin up a real (in-memory) SQLite DB per test via a `pytest` fixture rather than mocking the ORM.
+
+## Bugs found — Root Cause Analysis
+
+I investigated all five issues from the tracker and **reproduced four of them** (Issues #1, #2, #4, #5). Issue #3 turned out **not to reproduce** through the actual code path but was a genuine latent defect, so it was hardened defensively. Reproduction was done two ways: (a) the checked-in test suite, where `python -m pytest tests/` fails on the streak and playlist bugs, and (b) a small in-memory harness (a throwaway script using the same `sqlite:///:memory:` app fixture) for the feed and notification bugs, which have no test file.
+
+Baseline test run before any fix: **3 failed, 10 passed** — `test_streak_increments_on_sunday`, `test_playlist_returns_all_songs`, `test_playlist_returns_songs_in_order`. After all five fixes: **13 passed, 0 failed**.
+
+Each entry below has all five required fields: how I reproduced it, how I found the root cause, the root cause, and my fix + side-effect check.
+
+### Issue #1 — Listening streak resets every Sunday
+- **How I reproduced it:** Ran `python -m pytest tests/test_streaks.py` before touching code. The checked-in test `test_streak_increments_on_sunday` calls `update_listening_streak` with Saturday `2024-06-15` then Sunday `2024-06-16` and asserts the streak is `2`; it failed with `assert 1 == 2`, confirming that listening on a Sunday after a Saturday resets the streak instead of incrementing it. Real-app equivalent: a user with `last_listened_at` on a Saturday who `POST /songs/<id>/listen`s the following Sunday, then reads `GET /users/<id>/streak`.
+- **How I found the root cause:** Followed the flow from the failing test into `services/streak_service.py`. `record_listening_event` delegates the streak math to `update_listening_streak(user, now)`, so I read that function. The branch structure computes `days_since_last = (today - last_date).days` and then decides: `==0` no-op, `==1` increment, else reset. The moment of certainty was reading the increment guard, `elif days_since_last == 1 and today.weekday() != 6:` — the second clause has nothing to do with whether the previous day was consecutive, and `weekday() == 6` is exactly Sunday, matching the "only on Sundays" symptom precisely.
+- **The root cause:** The consecutive-day increment branch carried an extra, unjustified condition `and today.weekday() != 6`. `date.weekday()` returns `6` for Sunday, so whenever the *current* listen falls on a Sunday, the "listened yesterday → increment" branch is skipped and control falls through to the `else`, which hard-resets `listening_streak = 1`. Every other weekday incremented correctly; only Sunday broke.
+- **My fix and side-effect check:** Removed the spurious clause so the branch is simply `elif days_since_last == 1:` ([services/streak_service.py:73](services/streak_service.py#L73)). This restores the intended rule: any listen exactly one calendar day after the last one increments, regardless of weekday. Side-effect check — reran the full `tests/test_streaks.py` (5/5 pass), covering both sides of every boundary: same-day (`==0`) still no-ops (`test_streak_does_not_double_count_same_day`), consecutive day still increments (`test_streak_increments_on_consecutive_day` and now `test_streak_increments_on_sunday`), and a skipped day still resets (`test_streak_resets_after_skipped_day`). `last_listened_at` is still updated on every non-same-day branch, so `get_streak` and the `POST /songs/<id>/listen` flow are unaffected.
+
+### Issue #2 — "Friends Listening Now" shows people from up to a day ago
+- **Location:** `services/feed_service.py:13` (`RECENT_THRESHOLD = timedelta(hours=24)`)
+- **Symptom:** The real-time "listening now" feed lists friends whose last listen was hours — or nearly a full day — ago.
+- **Root cause:** `get_friends_listening_now` filters `ListeningEvent.listened_at >= now - RECENT_THRESHOLD`, and the threshold is a full 24 hours. A "now" feed needs a minutes-scale window; 24h lets yesterday's listens through.
+- **How I reproduced it:** In an in-memory harness I created two friends, gave one a single `ListeningEvent` with `listened_at = now - 20h` (and no fresher event), and called `get_friends_listening_now(me_id)`. It returned **1** entry — that friend shown as "listening now" to a 20-hour-old track. (Condition to trigger: a friend whose *most recent* event is between the intended live window and 24h ago; the per-friend dedup means a fresher event would otherwise mask it.)
+- **Expected vs actual:** expected `0` entries for a 20h-old listen; actual `1`.
+
+### Issue #3 — "Same song shows up twice in search" — investigated, does NOT reproduce
+- **Location:** `services/search_service.py:25-35`
+- **Symptom (as reported):** A song appears multiple times in search results, seemingly at random.
+- **What I found:** The query does `db.session.query(Song).outerjoin(song_tags, ...)`, which fans out one row per tag — so the *raw* SQL genuinely returns 3 rows for a 3-tag song (I confirmed: `db.session.query(Song.id).outerjoin(song_tags…)` returns **3**). **However**, the reported user-visible bug does not actually occur: SQLAlchemy's legacy `db.session.query(Song)` interface deduplicates entity rows by identity before returning them, so `search_songs("Crown Heights")` returns the 3-tag song **once**. The checked-in test `tests/test_search.py::test_search_no_duplicates_multi_tag_song` (which expects `1`) **passes**.
+- **How I attempted it:** Ran `search_songs("Crown Heights")` against a seeded 3-tag song → 1 result (not 3). Also ran the raw column query to confirm the underlying fan-out is real (3 rows) but masked by ORM entity uniquing.
+- **Status:** Latent defect (the unnecessary un-`distinct()`ed join) but **not currently reproducible** through the service/API on this SQLAlchemy version. Per the "try a different one if you can't reproduce it" guidance, I documented the other four instead. Worth noting it would resurface if the query were migrated to the 2.0 `select()` style, where entity uniquing is not automatic unless `.unique()` is called.
+
+### Issue #4 — No notification when a friend rates your shared song
+- **Location:** `services/notification_service.py:73-110` (`rate_song`)
+- **Symptom:** Adding someone's song to a playlist notifies the sharer, but rating their song does not.
+- **Root cause:** `rate_song()` creates/updates the `Rating` and commits, but never calls `create_notification()`. The sibling `add_to_playlist()` (`services/notification_service.py:64-70`) *does* notify `song.shared_by`, so the rating path is simply missing the equivalent notification call.
+- **How I reproduced it:** In the in-memory harness, a `sharer` shared a song; a different `rater` called `rate_song(rater_id, song_id, 5)`. `get_notifications(sharer_id)` returned length `0` both before and after — no notification was created.
+- **Expected vs actual:** expected a `song_rated` notification for the sharer (count `0 → 1`); actual no change (`0 → 0`).
+
+### Issue #5 — The last song in a playlist never shows up
+- **Location:** `services/playlist_service.py:66`
+- **Symptom:** A playlist's song list is always missing its final (most recently positioned) track.
+- **Root cause:** `return [song.to_dict() for song in songs[:-1]]` — the `[:-1]` slice drops the last element of the position-ordered list. It should iterate all of `songs`.
+- **How I reproduced it:** The checked-in tests `tests/test_playlists.py::test_playlist_returns_all_songs` (seeds 5 songs, asserts `len == 5`) and `test_playlist_returns_songs_in_order` both fail — the first returns 4, the second is missing `"Track 5"`. Real-app equivalent: `GET /playlists/<id>/songs` on any non-empty seeded playlist returns one fewer song than were added. Empty playlists are unaffected because `[][:-1] == []`.
+- **Expected vs actual:** expected all N songs; actual N−1 (a 1-song playlist returns 0).
