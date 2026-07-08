@@ -110,4 +110,5 @@ Each entry below has all five required fields: how I reproduced it, how I found 
 - **My fix and side-effect check:** Changed `songs[:-1]` to `songs` so every song is returned ([services/playlist_service.py:66](services/playlist_service.py#L66)). Boundary check across both sides via `tests/test_playlists.py` (3/3 pass): a 5-song playlist now returns all 5 in position order (`test_playlist_returns_all_songs`, `test_playlist_returns_songs_in_order`), and the empty-playlist case still returns `[]` without error (`test_empty_playlist_returns_empty_list`) — the slice removal is safe because iterating an empty list yields an empty list. Ordering is preserved since the `order_by(position)` in the query is untouched.
 
 
-Commit snipit: 
+Commit snipit: ![alt text](<git log --oneline snipit.JPG>)
+
