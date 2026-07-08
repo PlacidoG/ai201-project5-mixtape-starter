@@ -1,5 +1,23 @@
 # Mixtape — Codebase Map
 
+## AI Usage
+
+I used **Claude Code** (Anthropic's CLI, running Claude Opus/Sonnet) throughout this project, in an interactive back-and-forth. Below is an honest account of where it helped and where I had to check its work.
+
+**Environment and setup.** When `FLASK_APP=app:create_app flask run` failed with "command not found," I had it diagnose the cause — `flask.exe` was installed under a per-user Scripts directory that wasn't on my PATH — and it gave me the working `python -m flask run` invocation. It also explained why hitting `http://127.0.0.1:5000/` returned 404 (there is no `/` route; the app is a JSON API whose blueprints live under `/songs`, `/playlists`, `/users`, `/feed`).
+
+**Understanding the codebase.** Before changing anything, I asked it to trace specific data flows: how a song ends up in a friend's feed, what `streak_service.py` does, and a step-by-step of `get_notifications`. The most useful thing it surfaced was that the "feed" isn't stored anywhere — it's computed on read from `ListeningEvent` rows filtered by the `friendships` table — and that friendships are only ever created by `seed_data.py` (there's no API for them). It also produced the first draft of the codebase map in this document, which I reviewed against the source.
+
+**Finding, reproducing, and fixing the bugs.** I had it work through the five tracker issues one at a time: reproduce first, trace symptom → root cause, apply the smallest fix, check side effects, then write the RCA entry before moving on. For the streak and playlist bugs the checked-in tests were the reproduction; for the feed and notification bugs (which have no tests) it wrote throwaway in-memory scripts.
+
+**Where I had to verify, and where the AI was wrong or incomplete.**
+- **Issue #3 was the biggest correction.** In its initial written analysis the AI confidently claimed the duplicate-search bug reproduced — that a 3-tag song would come back 3× — and even drafted an RCA saying so. When we actually ran the code, `search_songs` returned the song **once** and the checked-in test passed. The AI had overlooked that SQLAlchemy's legacy `db.session.query()` de-duplicates whole entities by identity, which masks the join's row fan-out. Running it (and a raw-column query that did show 3 rows) is what caught the mistake; we reclassified #3 as a latent defect and hardened it rather than claiming a reproduction that wasn't real. This was the clearest case of "don't trust the explanation until you've run it."
+- **A bug it found by accident, outside the assignment.** While writing a verification harness for the rating notification, its `add_to_playlist` call crashed with `NOT NULL constraint failed: playlist_entries.position` — exposing a separate latent bug (appending via the `playlist.songs` relationship never populates the required `position`/`added_by` columns). It's not one of the five issues, so I left it unfixed, but it's worth noting the AI only surfaced it because a test harness exercised a path the seed data never does.
+- **Feed/notification behavior I checked myself.** Because there are no tests for those services, I didn't take the AI's word for the fixes — I had it print both sides of each boundary and confirmed them: a 10-minute-old listen appears in "listening now" while a 20-hour-old one doesn't, the activity feed still shows both (so I didn't over-narrow it), and a new rating notifies the sharer exactly once while re-rating and self-rating produce none.
+- **Date/weekday reasoning.** For the streak bug the AI asserted a specific calendar date was a Sunday; I relied on the checked-in test's own dates and the actual failing assertion (`assert 1 == 2`) as the real proof rather than its date arithmetic.
+
+Overall the AI was strongest at fast navigation and tracing call chains, and weakest when it reasoned about runtime/ORM behavior without executing — which is exactly where running the tests and small harnesses mattered most.
+
 ## Overview
 Mixtape is a Flask + SQLAlchemy social music API: friends share songs, build
 collaborative playlists, rate songs, and track listening streaks. It's a pure
@@ -29,7 +47,7 @@ services (business logic layer) operating on SQLAlchemy models.
 Note: this app has no "share a song" API endpoint — `Song` rows (and their
 `shared_by` owner) only ever get created by `seed_data.py`. The real,
 observable notification flow involving a shared song is triggered when
-*another* user adds that song to a playlist:
+*another* user adds that song to a playlist.:
 
 1. Client calls **`POST /playlists/<playlist_id>/songs`** with `{song_id, added_by}`.
 2. `routes/playlists.py` `add_song()` validates the two required fields are present, then calls `add_to_playlist(playlist_id, song_id, added_by)`.
@@ -90,3 +108,6 @@ Each entry below has all five required fields: how I reproduced it, how I found 
 - **How I found the root cause:** Traced `GET /playlists/<id>/songs` → `routes/playlists.py` → `playlist_service.get_playlist_songs`. The function queries the songs joined to `playlist_entries`, ordered ascending by `position` — correct so far. The last line is `return [song.to_dict() for song in songs[:-1]]`. The `[:-1]` slice was the smoking gun: it discards the final element of an otherwise-correct, correctly-ordered list, which exactly matches "the last (highest-position) song is missing."
 - **The root cause:** An off-by-one slice. `songs[:-1]` drops the last item of the position-ordered result, so an N-song playlist returns its first N−1 songs (and a 1-song playlist returns none). The query itself was fine; only the final list comprehension truncated it.
 - **My fix and side-effect check:** Changed `songs[:-1]` to `songs` so every song is returned ([services/playlist_service.py:66](services/playlist_service.py#L66)). Boundary check across both sides via `tests/test_playlists.py` (3/3 pass): a 5-song playlist now returns all 5 in position order (`test_playlist_returns_all_songs`, `test_playlist_returns_songs_in_order`), and the empty-playlist case still returns `[]` without error (`test_empty_playlist_returns_empty_list`) — the slice removal is safe because iterating an empty list yields an empty list. Ordering is preserved since the `order_by(position)` in the query is untouched.
+
+
+Commit snipit: 
